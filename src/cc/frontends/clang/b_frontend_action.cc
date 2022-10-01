@@ -1742,7 +1742,7 @@ void BFrontendAction::DoMiscWorkAround() {
   if (probefunc == "bpf_probe_read") {
     probefunc = "#define bpf_probe_read_kernel bpf_probe_read\n"
       "#define bpf_probe_read_kernel_str bpf_probe_read_str\n"
-      "#define bpf_probe_read_user bpf_probe_read\n"
+      "#define bpf_probe_read_user bpf_probe_read_user\n"
       "#define bpf_probe_read_user_str bpf_probe_read_str\n";
   }
   else {
