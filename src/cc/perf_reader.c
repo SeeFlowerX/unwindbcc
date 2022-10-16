@@ -25,6 +25,10 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <linux/un.h>
 #include <linux/types.h>
 #include <linux/perf_event.h>
 
@@ -35,20 +39,6 @@ enum {
   RB_NOT_USED = 0, // ring buffer not usd
   RB_USED_IN_MUNMAP = 1, // used in munmap
   RB_USED_IN_READ = 2, // used in read
-};
-
-struct perf_reader {
-  perf_reader_raw_cb raw_cb;
-  perf_reader_lost_cb lost_cb;
-  void *cb_cookie; // to be returned in the cb
-  void *buf; // for keeping segmented data
-  size_t buf_size;
-  void *base;
-  int rb_use_state;
-  pid_t rb_read_tid;
-  int page_size;
-  int page_cnt;
-  int fd;
 };
 
 struct perf_reader * perf_reader_new(perf_reader_raw_cb raw_cb,
@@ -63,6 +53,7 @@ struct perf_reader * perf_reader_new(perf_reader_raw_cb raw_cb,
   reader->fd = -1;
   reader->page_size = getpagesize();
   reader->page_cnt = page_cnt;
+  reader->is_unwind_call_stack = false;
   return reader;
 }
 
@@ -114,9 +105,86 @@ struct perf_sample_trace_kprobe {
   uint64_t ip;
 };
 
+bool ReadFully(int fd, void* data, size_t byte_count) {
+  uint8_t* p = (uint8_t*)data;
+  size_t remaining = byte_count;
+  while (remaining > 0) {
+    ssize_t n = read(fd, p, remaining);
+    if (n <= 0) return false;
+    p += n;
+    remaining -= n;
+  }
+  return true;
+}
+
+bool WriteFully(int fd, void* data, size_t byte_count) {
+  uint8_t* p = (uint8_t*)data;
+  size_t remaining = byte_count;
+  while (remaining > 0) {
+    ssize_t n = write(fd, p, remaining);
+    if (n == -1) return false;
+    p += n;
+    remaining -= n;
+  }
+  return true;
+}
+
+static void print_frame_info(int pid, uint8_t *ptr, int write_size) {
+  fprintf(stderr, "[%s] %d %p %d\n", __FUNCTION__, pid, ptr, write_size);
+
+  int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd == -1) {
+    fprintf(stderr, "cannot socket()!\n");
+  }
+  const char *socket_path = "/dev/socket/mysock";
+  struct sockaddr_un addr = {.sun_family = AF_UNIX};
+  strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
+ 
+  int ret = connect(fd, (struct sockaddr *)(&addr), sizeof(addr));
+  if (ret != 0) {
+    fprintf(stderr, "connect() to %s failed: %s\n", socket_path, strerror(errno));
+  } else {
+    WriteFully(fd, &pid, 4);
+    // write_size += 4;
+    WriteFully(fd, &write_size, 4);
+ 
+    if (!WriteFully(fd, ptr, write_size)) {
+      fprintf(stderr, "prepare to write %d bytes to socket\n", write_size);
+      close(fd);
+      return;
+    }
+    int frameinfo_size;
+    if (ReadFully(fd, &frameinfo_size, 4)) {
+      unsigned char frame_info[frameinfo_size + 1];
+      if (ReadFully(fd, frame_info, frameinfo_size)) {
+        frame_info[frameinfo_size] = '\0';
+        printf("===================================>Frame:\n");
+        printf("%s\n", frame_info);
+      } else {
+        fprintf(stderr, "Read frame_info from socket error.\n");
+      }
+    } else {
+      fprintf(stderr, "Read frameinfo_size from socket error.\n");
+    }
+    // fprintf(stderr, "Read frame_info from socket placeholder.\n");
+    close(fd);
+  }
+}
+
 static void parse_sw(struct perf_reader *reader, void *data, int size) {
   uint8_t *ptr = data;
   struct perf_event_header *header = (void *)data;
+
+    // struct {
+    //     struct perf_event_header header;
+    //     u32    size;               /* if PERF_SAMPLE_RAW */
+    //     char   data[size];         /* if PERF_SAMPLE_RAW */
+    //     u64    abi;                /* if PERF_SAMPLE_REGS_USER */
+    //     u64    regs[weight(mask)]; /* if PERF_SAMPLE_REGS_USER */
+    //     u64    size;               /* if PERF_SAMPLE_STACK_USER */
+    //     char   data[size];         /* if PERF_SAMPLE_STACK_USER */
+    //     u64    dyn_size;           /* if PERF_SAMPLE_STACK_USER && size != 0 */
+    // };
 
   struct {
       uint32_t size;
@@ -136,6 +204,45 @@ static void parse_sw(struct perf_reader *reader, void *data, int size) {
     return;
   }
 
+  if (reader->is_unwind_call_stack) {
+    // 这里要和bpf代码里面传递的数据结构一致
+    int pid = *(int *)raw->data;
+    // 这里的 size 是 perf_submit 传递的那个大小
+    // 这里的 data 是整个传递的数据 也就是 PERF_SAMPLE_RAW 部分
+    // 到此处 ptr 也就是 PERF_SAMPLE_RAW 结尾
+    // 也就是说 write_size 是 PERF_SAMPLE_REGS_USER 和 PERF_SAMPLE_STACK_USER 的整个大小
+    int write_size = ((uint8_t *)data + size) - ptr;
+    print_frame_info(pid, ptr, write_size);
+  }
+
+  // enum perf_sample_regs_abi {
+  //   PERF_SAMPLE_REGS_ABI_NONE = 0,
+  //   PERF_SAMPLE_REGS_ABI_32 = 1,
+  //   PERF_SAMPLE_REGS_ABI_64 = 2,
+  // };
+
+  // struct {
+  //     uint64_t abi;
+  //     uint64_t regs[33];
+  // } *user_regs = NULL;
+  // user_regs = (void *)ptr;
+  // ptr += 8 + 8 * 33;
+  // fprintf(stderr, "[%s] pid=%d abi=%lu\n", __FUNCTION__, *(int *)raw->data, user_regs->abi);
+
+  // struct {
+  //     uint64_t size;
+  //     // 这个是 bcc 里面预设的固定值 sample_stack_user
+  //     char data[16384];
+  //     uint64_t dyn_size;
+  // } *user_stack = NULL;
+  // user_stack = (void *)ptr;
+  // ptr += 8 + user_stack->size + 8;
+  // fprintf(stderr, "[%s] size=%lu dyn_size=%lu\n", __FUNCTION__, user_stack->size, user_stack->dyn_size);
+
+  if (reader->is_unwind_call_stack) {
+    // hack ptr
+    ptr += 16672;
+  }
   // sanity check
   if (ptr != (uint8_t *)data + size) {
     fprintf(stderr, "%s: extra data at end of sample\n", __FUNCTION__);

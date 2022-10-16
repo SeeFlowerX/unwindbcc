@@ -39,6 +39,7 @@ struct bcc_perf_buffer_opts {
   int pid;
   int cpu;
   int wakeup_events;
+  int unwind_call_stack;
 };
 
 int bcc_create_map(enum bpf_map_type map_type, const char *name,

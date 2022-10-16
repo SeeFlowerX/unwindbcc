@@ -1450,6 +1450,15 @@ void * bpf_open_perf_buffer_opts(perf_reader_raw_cb raw_cb,
   attr.sample_type = PERF_SAMPLE_RAW;
   attr.sample_period = 1;
   attr.wakeup_events = opts->wakeup_events;
+
+if (opts->unwind_call_stack == 1) {
+    attr.sample_type |= PERF_SAMPLE_STACK_USER | PERF_SAMPLE_REGS_USER;
+    attr.sample_stack_user = 16384; // MAX=65528
+    attr.sample_regs_user = ((1ULL << 33) - 1);
+    attr.size = sizeof(struct perf_event_attr);
+    reader->is_unwind_call_stack = true;
+  }
+
   pfd = syscall(__NR_perf_event_open, &attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
   if (pfd < 0) {
     fprintf(stderr, "perf_event_open: %s\n", strerror(errno));
